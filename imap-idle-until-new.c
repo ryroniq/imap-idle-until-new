@@ -3,45 +3,26 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 #include <netdb.h>
 
 #define TAG         "A%04d"
 #define COMMAND_LOG "======== %s"
+#define LINEBUF_SIZE 4096
 
 enum {IDLE_NEWMAIL, IDLE_REISSUE, IDLE_ERROR};
 
-int sock;
-SSL_CTX *ctx;
-SSL *ssl;
+typedef struct {
+	char buf[LINEBUF_SIZE];
+	int start;
+	int len;
+} linebuf_t;
 
-const char *cert_path;
+int sock;
+
 const char *host;
 const char *port;
 const char *user;
 const char *pass;
-
-void initialize_openssl() {
-	SSL_load_error_strings();
-	OpenSSL_add_ssl_algorithms();
-}
-
-void cleanup_openssl() {
-	EVP_cleanup();
-}
-
-void initialize_context() {
-	ctx = SSL_CTX_new(TLS_client_method());
-	if (!ctx) {
-		ERR_print_errors_fp(stderr);
-		exit(EXIT_FAILURE);
-	}
-	if (SSL_CTX_load_verify_locations(ctx, cert_path, NULL) <= 0) {
-		ERR_print_errors_fp(stderr);
-		exit(EXIT_FAILURE);
-	}
-}
 
 void initialize_sock(void) {
 	struct addrinfo hints, *res;
@@ -78,29 +59,76 @@ cleanup:
 		exit(EXIT_FAILURE);
 }
 
-int process_response(const char *ok, const char *ng) {
-	char buffer[1024];
-	int bytes;
+/*
+ * Reads one CRLF- or LF-terminated line at a time out of an internal
+ * buffer, issuing further read() calls as needed. A line that is split
+ * across multiple TCP reads is reassembled before being handed back, and
+ * any bytes read past the end of the line are kept for the next call.
+ * *line points into the internal buffer and stays valid only until the
+ * next read_line() call. Returns 1 with *line set on success, 0 on EOF,
+ * -1 on error.
+ */
+int read_line(linebuf_t *lb, char **line) {
+	for (;;) {
+		char *start = lb->buf + lb->start;
+		char *nl = memchr(start, '\n', lb->len);
+		if (nl) {
+			int line_len = nl - start;
+			if (line_len > 0 && start[line_len - 1] == '\r')
+				start[line_len - 1] = 0;
+			else
+				start[line_len] = 0;
 
-	while ((bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1)) > 0) {
-		buffer[bytes] = 0;
-		printf("%s", buffer);
+			*line = start;
 
-		if (strstr(buffer, ok))
+			int consumed = line_len + 1;
+			lb->start += consumed;
+			lb->len -= consumed;
 			return 1;
-		if (ng && strstr(buffer, ng))
+		}
+
+		/* No full line buffered yet; make room for more data, compacting
+		 * only now that the previously returned line is no longer needed. */
+		if (lb->start > 0) {
+			memmove(lb->buf, lb->buf + lb->start, lb->len);
+			lb->start = 0;
+		}
+
+		if (lb->len >= LINEBUF_SIZE - 1) {
+			fprintf(stderr, "Server line exceeded %d bytes\n", LINEBUF_SIZE);
+			return -1;
+		}
+
+		int bytes = read(sock, lb->buf + lb->len, LINEBUF_SIZE - 1 - lb->len);
+		if (bytes <= 0) {
+			if (bytes < 0)
+				perror("read");
+			return bytes;
+		}
+
+		lb->len += bytes;
+	}
+}
+
+int process_response(linebuf_t *lb, const char *ok, const char *ng) {
+	char *line;
+	int rc;
+
+	while ((rc = read_line(lb, &line)) == 1) {
+		printf("%s\n", line);
+
+		if (strstr(line, ok))
+			return 1;
+		if (ng && strstr(line, ng))
 			return 0;
 	}
-
-	if (bytes < 0)
-		ERR_print_errors_fp(stderr);
 
 	return 0;
 }
 
-int process_idle(void) {
-	char buffer[1024];
-	int bytes, cnt = 0;
+int process_idle(linebuf_t *lb) {
+	char *line;
+	int rc, cnt = 0;
 
 	time_t last = time(NULL);
 	if (last == (time_t)(-1)) {
@@ -108,11 +136,10 @@ int process_idle(void) {
 		return IDLE_ERROR;
 	}
 
-	while ((bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1)) > 0) {
-		buffer[bytes] = 0;
-		printf("%s", buffer);
+	while ((rc = read_line(lb, &line)) == 1) {
+		printf("%s\n", line);
 
-		if (strstr(buffer, "* OK Still here") == buffer) {
+		if (strstr(line, "* OK Still here") == line) {
 			time_t now = time(NULL);
 			if (now == (time_t)(-1)) {
 				perror("Failed to get current time");
@@ -125,22 +152,15 @@ int process_idle(void) {
 
 			if (cnt > 14)
 				return IDLE_REISSUE;
-		} else if (strstr(buffer, "* ") == buffer) {
+		} else if (strstr(line, "* ") == line) {
 			return IDLE_NEWMAIL;
 		}
 	}
-
-	if (bytes < 0)
-		ERR_print_errors_fp(stderr);
 
 	return IDLE_ERROR;
 }
 
 int main(void) {
-	if (!(cert_path = getenv("CERT_PATH"))) {
-		fprintf(stderr, "$CERT_PATH is not set\n");
-		return 2;
-	}
 	if (!(host = getenv("HOST"))) {
 		fprintf(stderr, "$HOST is not set\n");
 		return 2;
@@ -149,33 +169,27 @@ int main(void) {
 		fprintf(stderr, "$PORT is not set\n");
 		return 2;
 	}
-	if (!(user = getenv("USER"))) {
-		fprintf(stderr, "$USER is not set\n");
+	if (!(user = getenv("IMAP_USER"))) {
+		fprintf(stderr, "$IMAP_USER is not set\n");
 		return 2;
 	}
-	if (!(pass = getenv("PASS"))) {
-		fprintf(stderr, "$PASS is not set\n");
+	if (!(pass = getenv("IMAP_PASS"))) {
+		fprintf(stderr, "$IMAP_PASS is not set\n");
 		return 2;
 	}
 
-	initialize_openssl();
-	initialize_context();
 	initialize_sock();
 
-	ssl = SSL_new(ctx);
-	SSL_set_fd(ssl, sock);
+	printf("Connected to %s.\n", host);
 
-	if (SSL_connect(ssl) <= 0) {
-		ERR_print_errors_fp(stderr);
-		goto cleanup;
-	}
+	linebuf_t lb = {0};
 
-	printf("Connected to %s over TLS.\n", host);
+	int ret = 0;
 
-	if (!process_response("* OK", NULL))
+	if (!process_response(&lb, "* OK", NULL))
 		goto cleanup;
 
-	int ret = 0, seq = 0, len;
+	int seq = 0, len;
 	char buffer[100], ok[20], ng[20];
 
 	seq++;
@@ -183,11 +197,11 @@ int main(void) {
 	snprintf(ok, sizeof(ok), TAG " OK", seq);
 	snprintf(ng, sizeof(ng), TAG " NO", seq);
 
-	SSL_write(ssl, buffer, len);
+	write(sock, buffer, len);
 	snprintf(buffer, sizeof(buffer), TAG " LOGIN %s ******\r\n", seq, user);
 	printf(COMMAND_LOG, buffer);
 
-	if (!process_response(ok, ng))
+	if (!process_response(&lb, ok, ng))
 		goto cleanup;
 
 	seq++;
@@ -195,29 +209,29 @@ int main(void) {
 	snprintf(ok, sizeof(ok), TAG " OK", seq);
 	snprintf(ng, sizeof(ng), TAG " NO", seq);
 
-	SSL_write(ssl, buffer, len);
+	write(sock, buffer, len);
 	printf(COMMAND_LOG, buffer);
 
-	if (!process_response(ok, ng))
+	if (!process_response(&lb, ok, ng))
 		goto cleanup;
 
 	while (1) {
 		seq++;
 		len = snprintf(buffer, sizeof(buffer), TAG " IDLE\r\n", seq);
 
-		SSL_write(ssl, buffer, len);
+		write(sock, buffer, len);
 		printf(COMMAND_LOG, buffer);
 
-		int status = process_idle();
+		int status = process_idle(&lb);
 
 		len = snprintf(buffer, sizeof(buffer), "DONE\r\n");
 		snprintf(ok, sizeof(ok), TAG " OK", seq);
 		snprintf(ng, sizeof(ng), TAG " NO", seq);
 
-		SSL_write(ssl, buffer, len);
+		write(sock, buffer, len);
 		printf(COMMAND_LOG, buffer);
 
-		if (!process_response(ok, ng))
+		if (!process_response(&lb, ok, ng))
 			goto cleanup;
 
 		switch (status) {
@@ -236,10 +250,10 @@ logout:
 	snprintf(ok, sizeof(ok), TAG " OK", seq);
 	snprintf(ng, sizeof(ng), TAG " NO", seq);
 
-	SSL_write(ssl, buffer, len);
+	write(sock, buffer, len);
 	printf(COMMAND_LOG, buffer);
 
-	if (!process_response(ok, ng))
+	if (!process_response(&lb, ok, ng))
 		goto cleanup;
 
 	if (0) {
@@ -247,10 +261,7 @@ cleanup:
 		ret = 1;
 	}
 
-	SSL_free(ssl);
 	close(sock);
-	SSL_CTX_free(ctx);
-	cleanup_openssl();
 
 	return ret;
 }
